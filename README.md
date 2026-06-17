@@ -2,15 +2,81 @@
 
 **Health monitor and auto-healer for Hermes Agent.**
 
-Doctor Noshy watches your Hermes install and tells you when something breaks. It checks the gateway, providers, system resources, and Hermes-specific components. When things go critical, it can restart services automatically and send alerts.
+Hermes is powerful but it runs a lot of moving parts: gateway process, systemd services, provider connections, tunnels, dashboards, cron jobs, memory files, skills. When something breaks, you usually find out when a message doesn't get a reply. Doctor Noshy finds out first.
+
+## Why You Need This
+
+If you run Hermes as a daily driver, you have experienced at least one of these:
+
+- The gateway crashed silently and you didn't notice for hours
+- A provider went down and every request was failing with no visible error
+- Disk filled up and memory writes started failing
+- A cron job stopped running and you only found out when something didn't happen
+- You restarted everything manually to fix something that should have been automatic
+
+Doctor Noshy eliminates all of these. It runs 18 health checks, tells you what is wrong, and can fix common problems without you touching anything.
+
+## What It Does
+
+**Health Checks** -- 18 checks covering every layer of your Hermes install:
+
+| Layer | Checks |
+|-------|--------|
+| Gateway | Process running, port listening, HTTP responding, systemd active |
+| Dashboard | Service active, port listening |
+| Network | Cloudflared/ngrok tunnel active |
+| Providers | Nous Portal reachable, OpenRouter reachable, local API server |
+| System | CPU usage, RAM usage, disk space |
+| Hermes | Config exists, auth credentials, skills installed, memory file sizes, cron jobs |
+
+**Auto-Healer** -- When something critical fails, Doctor Noshy restarts it:
+
+- Gateway process dies -> restarts openclaw-gateway or hermes-gateway
+- Gateway port unresponsive -> restarts the service
+- Config missing -> tells you to run hermes setup
+
+No more manually SSHing in to restart things.
+
+**Alerts** -- Get notified when something goes wrong, before you even notice:
+
+- Discord webhook (one line to configure)
+- Telegram bot
+- Email via SMTP
+
+Configure with environment variables or a simple YAML file.
+
+**Web Dashboard** -- Dark-themed status page at http://127.0.0.1:9200/:
+
+- All 18 checks at a glance
+- Color-coded status (green/yellow/red)
+- Auto-refreshes every 30 seconds
+- JSON API for custom integrations
+
+**Continuous Monitoring** -- Run as a systemd service that watches everything:
+
+- Checks every 2 minutes (configurable)
+- Auto-heals on failure
+- Sends alerts on degradation
+- Logs to journalctl
 
 ## Quick Start
 
 ```bash
-# Install
 pip install doctor-noshy
 
-# Or install from source
+# One-shot health check
+doctor diagnose
+
+# Start monitoring
+doctor watch
+
+# Auto-heal critical issues
+doctor heal
+```
+
+Or install from source:
+
+```bash
 git clone https://github.com/Noshkoto/DoctorNoshy.git
 cd DoctorNoshy
 pip install -e ".[dashboard]"
@@ -19,122 +85,87 @@ pip install -e ".[dashboard]"
 ## Commands
 
 ```bash
-# Run all health checks once
-doctor diagnose
-
-# Continuous monitoring (checks every 60s)
-doctor watch
-
-# Auto-heal critical issues
-doctor heal
-
-# Generate a report
-doctor report
-doctor report --json
-
-# Start web dashboard (port 9200)
-doctor dashboard
-
-# Test alert channels
-doctor alerts
+doctor diagnose              # Run all checks once
+doctor diagnose --checks gateway,cpu  # Run specific checks
+doctor watch -i 120          # Monitor every 2 minutes
+doctor heal                  # Check + auto-fix
+doctor heal -y               # Skip confirmation
+doctor report                # Markdown report
+doctor report --json         # JSON for scripting
+doctor dashboard             # Web UI on :9200
+doctor alerts                # Test notification channels
 ```
-
-## What It Checks
-
-| Check | What it does |
-|-------|-------------|
-| Config File | Hermes config.yaml exists |
-| Auth Store | Provider credentials configured |
-| Gateway Process | Gateway process is running |
-| Gateway Port | Listening on :18789 |
-| Gateway HTTP | Responds to HTTP requests |
-| Gateway Service | Systemd service active |
-| Dashboard Service | Dashboard service active |
-| Dashboard Port | Dashboard listening on :9119 |
-| Tunnel | Cloudflared or ngrok active |
-| Local API Server | Hermes API on :8642 |
-| Nous Portal | Nous Portal API reachable |
-| OpenRouter | OpenRouter API reachable |
-| CPU Usage | System CPU load |
-| Memory | RAM usage |
-| Disk Space | Free disk space |
-| Skills | Installed skill count |
-| Memory Files | MEMORY.md / USER.md sizes |
-| Cron Jobs | Scheduled job counts |
 
 ## Alerts
 
-Configure alerts via environment variables or `doctor-noshy.yaml`:
+Set one environment variable to start getting alerts:
 
 ```bash
-# Discord
+# Discord (most common)
 export DOCTOR_DISCORD_WEBHOOK="https://discord.com/api/webhooks/..."
 
-# Telegram
+# Or Telegram
 export DOCTOR_TELEGRAM_TOKEN="your-bot-token"
 export DOCTOR_TELEGRAM_CHAT="chat-id"
 
-# Email (SMTP)
+# Or email
 export DOCTOR_SMTP_HOST="smtp.gmail.com"
-export DOCTOR_SMTP_PORT="587"
 export DOCTOR_SMTP_USER="you@gmail.com"
 export DOCTOR_SMTP_PASS="app-password"
 export DOCTOR_ALERT_TO="you@gmail.com"
 ```
 
-Or create `doctor-noshy.yaml`:
+Or create `doctor-noshy.yaml` in your home directory:
 
 ```yaml
 discord_webhook: https://discord.com/api/webhooks/...
-telegram_bot_token: your-bot-token
-telegram_chat_id: chat-id
 ```
 
-## Web Dashboard
+## Systemd Service (Recommended)
+
+Run Doctor Noshy as a background service:
 
 ```bash
-# Requires Flask
-pip install doctor-noshy[dashboard]
-
-doctor dashboard
-# → http://127.0.0.1:9200/
-```
-
-Dark-themed dashboard with auto-refresh every 30 seconds. Shows all check results with color-coded status.
-
-## Systemd Service
-
-```bash
-# Install the service
 cp systemd/doctor-noshy.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now doctor-noshy
 
-# Check status
-systemctl --user status doctor-noshy
+# Check what it is doing
 journalctl --user -u doctor-noshy -f
 ```
 
-## Auto-Healer
+## Auto-Healer Details
 
-The `doctor heal` command attempts to fix critical issues automatically:
+The healer attempts to fix these critical issues:
 
-- **Gateway not running** → restarts `openclaw-gateway` or `hermes-gateway` service
-- **Gateway port unresponsive** → restarts the gateway service
-- **Config missing** → tells you to run `hermes setup`
+| Issue | Action |
+|-------|--------|
+| Gateway process not running | Restarts openclaw-gateway, falls back to hermes-gateway |
+| Gateway port not listening | Restarts the gateway service |
+| Gateway HTTP not responding | Restarts the gateway service |
+| Config file missing | Reports (manual fix required) |
 
-It asks for confirmation before acting (use `-y` to skip).
+The healer asks for confirmation before acting. Use `doctor heal -y` to skip confirmation for automated workflows.
+
+## Use Cases
+
+**Personal Hermes setup** -- You run Hermes on a VPS or home server and want to know immediately when something breaks. Set up Discord alerts and the systemd service and forget about it.
+
+**Multi-instance monitoring** -- Run `doctor diagnose --json` on each instance and pipe the output to a central dashboard or log aggregation system.
+
+**CI/CD health gate** -- Run `doctor diagnose` before deploying updates. If anything is critical, block the deploy.
+
+**Incident response** -- When Hermes stops responding, run `doctor heal` to automatically restart failed components instead of guessing what is wrong.
 
 ## Architecture
 
 ```
-doctor diagnose
-    │
-    ├── checks.py       (18 health checks)
-    ├── healer.py        (auto-heal logic)
-    ├── alerts.py        (Discord/Telegram/Email)
-    ├── dashboard.py     (Flask web UI)
-    └── cli.py           (argparse interface)
+doctor_noshy/
+  checks.py      18 health checks (gateway, providers, system, hermes)
+  healer.py      Auto-heal logic for critical failures
+  alerts.py      Discord / Telegram / Email dispatch
+  dashboard.py   Flask web UI and JSON API
+  cli.py         argparse CLI interface
 ```
 
 ## License
