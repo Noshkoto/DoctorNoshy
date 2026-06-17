@@ -1,0 +1,15 @@
+[Unit]
+Description=Doctor Noshy - Hermes Agent Health Monitor
+After=network.target openclaw-gateway.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m doctor_noshy.cli watch -i 120
+WorkingDirectory=%h
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
