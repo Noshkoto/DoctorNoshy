@@ -21,7 +21,7 @@ from typing import List
 from . import __version__
 from .checks import CheckResult, run_all_checks, summary
 from .healer import get_heal_plan, heal
-from .alerts import send_alerts, format_alert
+from .alerts import send_alerts
 
 log = logging.getLogger("doctor")
 
@@ -154,7 +154,6 @@ def cmd_report(args: argparse.Namespace) -> int:
 
 def cmd_alerts(args: argparse.Namespace) -> int:
     """Test alert channels."""
-    from .checks import CheckResult
     test_results = [
         CheckResult(name="Test Check", status="warn", message="This is a test alert from Doctor Noshy"),
     ]
@@ -192,7 +191,6 @@ def main(argv: List[str] | None = None) -> int:
     )
     parser.add_argument("--version", action="version", version=f"doctor-noshy {__version__}")
     parser.add_argument("-v", "--verbose", action="store_true", help="Show detailed output")
-    parser.add_argument("--json", action="store_true", help="Output as JSON")
 
     sub = parser.add_subparsers(dest="command", help="Available commands")
 

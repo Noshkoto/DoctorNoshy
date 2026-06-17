@@ -86,10 +86,12 @@ def _send_discord(message: str, color: int = 0xE74C3C) -> bool:
             log.warning("Discord alert failed: %s", e)
             return False
     else:
+        # Pipe the JSON via stdin so embedded newlines don't break argv parsing.
         result = subprocess.run(
             ["curl", "-s", "-X", "POST", webhook,
              "-H", "Content-Type: application/json",
-             "-d", json.dumps(payload)],
+             "--data-binary", "@-"],
+            input=json.dumps(payload).encode("utf-8"),
             capture_output=True, timeout=10,
         )
         return result.returncode == 0
@@ -106,24 +108,28 @@ def _send_telegram(message: str) -> bool:
     if not token or not chat_id:
         return False
 
+    # Telegram's legacy Markdown rejects messages with unescaped `_` (e.g.
+    # check names like "Memory_Files") or `**bold**`. Send as plain text to
+    # avoid `Bad Request: can't parse entities`.
+    text = f"\U0001fa7a Doctor Noshy\n\n{message}"
     if requests:
         try:
             url = f"https://api.telegram.org/bot{token}/sendMessage"
             resp = requests.post(url, json={
                 "chat_id": chat_id,
-                "text": f"\U0001fa7a Doctor Noshy\n\n{message}",
-                "parse_mode": "Markdown",
+                "text": text,
             }, timeout=10)
             return resp.status_code == 200
         except Exception as e:
             log.warning("Telegram alert failed: %s", e)
             return False
     else:
+        # Use --data-urlencode so newlines in `text` survive form encoding.
         result = subprocess.run(
             ["curl", "-s", "-X", "POST",
              f"https://api.telegram.org/bot{token}/sendMessage",
-             "-d", f"chat_id={chat_id}",
-             "-d", f"text=\U0001fa7a Doctor Noshy\n\n{message}"],
+             "--data-urlencode", f"chat_id={chat_id}",
+             "--data-urlencode", f"text={text}"],
             capture_output=True, timeout=10,
         )
         return result.returncode == 0
@@ -136,17 +142,22 @@ def _send_telegram(message: str) -> bool:
 def _send_email(subject: str, body: str) -> bool:
     config = _load_config()
     host = config.get("smtp_host", "")
-    if not host:
+    to_addr = config.get("alert_email_to", "")
+    if not host or not to_addr:
         return False
 
     msg = MIMEText(body)
     msg["Subject"] = subject
     msg["From"] = config.get("alert_email_from", "doctor-noshy@localhost")
-    msg["To"] = config.get("alert_email_to", "")
+    msg["To"] = to_addr
 
     try:
-        with smtplib.SMTP(host, config.get("smtp_port", 587)) as server:
-            server.starttls()
+        port = int(config.get("smtp_port", 587))
+        with smtplib.SMTP(host, port) as server:
+            server.ehlo()
+            if server.has_extn("starttls"):
+                server.starttls()
+                server.ehlo()
             user = config.get("smtp_user", "")
             pwd = config.get("smtp_pass", "")
             if user and pwd:

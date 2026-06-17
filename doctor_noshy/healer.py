@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import logging
-import subprocess
 import time
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List
 
 from .checks import CheckResult, _run, _systemctl_user
 

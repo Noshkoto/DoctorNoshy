@@ -6,8 +6,8 @@ Statuses: ok, warn, critical, unknown
 
 from __future__ import annotations
 
+import json
 import os
-import re
 import shutil
 import subprocess
 import time
@@ -425,7 +425,7 @@ def check_skills() -> CheckResult:
     count = sum(1 for _ in skills_dir.rglob("SKILL.md"))
     return CheckResult(
         name="Skills",
-        status="ok",
+        status="ok" if count > 0 else "warn",
         message=f"{count} skills installed",
         details={"count": count},
         elapsed_ms=elapsed,
@@ -480,7 +480,6 @@ def check_cron_jobs() -> CheckResult:
         )
 
     try:
-        import json
         data = json.loads(jobs_file.read_text())
         jobs = data if isinstance(data, list) else data.get("jobs", [])
         enabled = sum(1 for j in jobs if j.get("enabled", True))

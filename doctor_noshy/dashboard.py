@@ -6,13 +6,9 @@ Requires Flask (pip install doctor-noshy[dashboard]).
 
 from __future__ import annotations
 
-import json
-import time
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict
 
-from .checks import run_all_checks, summary, CheckResult
+from .checks import run_all_checks, summary
 
 
 def create_app():
