@@ -13,7 +13,7 @@ import smtplib
 import subprocess
 from email.mime.text import MIMEText
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 try:
     import requests
@@ -21,6 +21,9 @@ except ImportError:
     requests = None  # type: ignore[assignment]
 
 from .checks import CheckResult
+
+if TYPE_CHECKING:  # avoid runtime circular import
+    from .healer import HealAction
 
 log = logging.getLogger("doctor.alerts")
 
@@ -222,5 +225,79 @@ def send_alerts(results: List[CheckResult], channels: Optional[List[str]] = None
         outcomes["telegram"] = _send_telegram(message)
     if "email" in all_channels:
         outcomes["email"] = _send_email("Doctor Noshy Alert", message)
+
+    return outcomes
+
+
+# ---------------------------------------------------------------------------
+# Heal-event templates
+#
+# Check-level events (thrashing detected, blocked count above threshold) are
+# already covered by send_alerts() because they show up as warn/critical check
+# results. The functions below cover *healer* events — actions the doctor took
+# autonomously — which otherwise would only appear in CLI output.
+# ---------------------------------------------------------------------------
+
+def format_heal_alert(actions: List["HealAction"]) -> str:
+    """Format heal actions into a human-readable alert body."""
+    reaped = [a for a in actions if a.action == "reap-zombie" and a.success]
+    released = [
+        a for a in actions
+        if a.action == "release-stale" and a.success
+    ]
+    blocked = [
+        a for a in actions
+        if a.action == "release-stale+block" and a.success
+    ]
+    failed = [a for a in actions if not a.success]
+
+    lines: List[str] = []
+    if reaped:
+        lines.append("**Zombie workers reaped:**")
+        for a in reaped:
+            lines.append(f"  \U0001fa6a {a.message}")  # 🪦
+    if released:
+        lines.append("**Stale claims released:**")
+        for a in released:
+            lines.append(f"  \U0001f513 {a.message}")  # 🔓
+    if blocked:
+        lines.append("**Tasks auto-blocked by doctor-noshy:**")
+        for a in blocked:
+            lines.append(f"  \U0001f6d1 {a.message}")  # 🛑
+    if failed:
+        lines.append("**Heal failures:**")
+        for a in failed:
+            lines.append(f"  ❌ {a.message}")  # ❌
+
+    return "\n".join(lines)
+
+
+def send_heal_alerts(
+    actions: List["HealAction"],
+    channels: Optional[List[str]] = None,
+) -> Dict[str, bool]:
+    """Dispatch heal-action notifications to all configured channels.
+
+    No-ops when ``actions`` is empty or when no notable events occurred (e.g.
+    only no-op 'none' actions for un-healable issues).
+    """
+    if not actions:
+        return {}
+    body = format_heal_alert(actions)
+    if not body.strip():
+        return {}
+
+    # Orange/warn color — heal actions are notable but not critical alarms.
+    color = 0xF39C12
+    message = f"Doctor Noshy heal actions:\n\n{body}"
+    outcomes: Dict[str, bool] = {}
+    all_channels = channels or ["discord", "telegram", "email"]
+
+    if "discord" in all_channels:
+        outcomes["discord"] = _send_discord(message, color)
+    if "telegram" in all_channels:
+        outcomes["telegram"] = _send_telegram(message)
+    if "email" in all_channels:
+        outcomes["email"] = _send_email("Doctor Noshy Heal Actions", message)
 
     return outcomes

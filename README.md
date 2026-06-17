@@ -28,6 +28,7 @@ Doctor Noshy eliminates all of these. It runs 18 health checks, tells you what i
 | Providers | Nous Portal reachable, OpenRouter reachable, local API server |
 | System | CPU usage, RAM usage, disk space |
 | Hermes | Config exists, auth credentials, skills installed, memory file sizes, cron jobs |
+| Kanban (NEW) | Dispatcher alive, zombie workers, stale-lock thrashing, blocked tasks, duplicate workers — see [Kanban Health](#kanban-health-new) |
 
 **Auto-Healer** -- When something critical fails, Doctor Noshy restarts it:
 
@@ -96,6 +97,51 @@ doctor dashboard             # Web UI on :9200
 doctor alerts                # Test notification channels
 ```
 
+## Kanban Health (NEW)
+
+Hermes' multi-agent Kanban board (v0.15+) lives at `~/.hermes/kanban.db`. The dispatcher catches *most* worker failures, but there are three documented failure modes it misses:
+
+- **Zombie workers** — a SIGTERM'd worker can leave a `<defunct>` entry in the process table; Hermes' `os.kill(pid, 0)` heuristic returns truthy for zombies, so the claim is never released.
+- **Stale-lock thrash loops** — long single tool calls can exceed the 15-minute claim TTL; the dispatcher reclaims and respawns, sometimes producing duplicate workers on the same `task_id` burning tokens.
+- **Silent retry-cap exhaustion** — tasks that hit `kanban.failure_limit` go to `blocked` and can sit there indefinitely with nothing surfacing them outside the dashboard.
+
+Doctor Noshy adds five checks for these (skipped cleanly if `kanban.db` isn't present):
+
+| Check | What it does |
+|-------|-------------|
+| Kanban Dispatcher | Dispatcher daemon process is running |
+| Kanban Zombie Workers | Detects in-progress tasks whose claimed PID is a zombie (`psutil.STATUS_ZOMBIE`, not just `os.kill(pid, 0)`) |
+| Kanban Thrashing | Same `task_id` reclaimed N+ times in a rolling window (defaults: 3 reclaims / 30 min) |
+| Kanban Blocked | Counts tasks in `blocked` state; warns above threshold (default 5) |
+| Kanban Duplicate Workers | Multiple open `task_runs` for the same `task_id` |
+
+### Kanban heal actions
+
+`doctor heal` adds two new auto-heal flows for these criticals:
+
+- **Reap zombie workers** — `SIGKILL`s the zombie PID and releases its claim in `kanban.db` (back to `pending`) so the dispatcher can re-pick it cleanly.
+- **Release stale claims** — releases claims on thrashing tasks. Set `DOCTOR_KANBAN_AUTO_BLOCK_ON_THRASH=1` to also auto-set the task to `blocked` with a reason like `auto-blocked by doctor-noshy: thrashing detected, 4 reclaims in window`.
+
+Both follow the existing confirm-before-acting pattern (`-y` to skip the prompt).
+
+### Kanban tuning
+
+| Env var | Default | What it controls |
+|---------|---------|------------------|
+| `DOCTOR_KANBAN_THRASH_RECLAIMS` | 3 | Reclaims in window to flag thrashing |
+| `DOCTOR_KANBAN_THRASH_WINDOW_MIN` | 30 | Rolling window in minutes |
+| `DOCTOR_KANBAN_BLOCKED_WARN` | 5 | Blocked-task count that promotes the check from `ok` to `warn` |
+| `DOCTOR_KANBAN_AUTO_BLOCK_ON_THRASH` | unset | If `1`, healer auto-blocks instead of just releasing |
+
+### Assumed kanban.db schema
+
+Doctor Noshy inspects `kanban.db` read-only and assumes:
+
+- `tasks(id, status, worker_pid, blocked_reason, updated_at)` with statuses `pending | in_progress | blocked | done | failed`
+- `task_runs(task_id, worker_pid, started_at, ended_at, outcome)` with outcomes including `reclaimed` and `released`
+
+Schema mismatches surface as `status: unknown` on the relevant check with the SQLite error attached — they won't crash the rest of the diagnose run.
+
 ## Alerts
 
 Set one environment variable to start getting alerts:
@@ -144,6 +190,8 @@ The healer attempts to fix these critical issues:
 | Gateway port not listening | Restarts the gateway service |
 | Gateway HTTP not responding | Restarts the gateway service |
 | Config file missing | Reports (manual fix required) |
+| Kanban zombie workers | SIGKILLs zombie PID, releases claim in kanban.db |
+| Kanban thrashing tasks | Releases stale claim (optionally auto-blocks via `DOCTOR_KANBAN_AUTO_BLOCK_ON_THRASH=1`) |
 
 The healer asks for confirmation before acting. Use `doctor heal -y` to skip confirmation for automated workflows.
 

@@ -21,7 +21,7 @@ from typing import List
 from . import __version__
 from .checks import CheckResult, run_all_checks, summary
 from .healer import get_heal_plan, heal
-from .alerts import send_alerts
+from .alerts import send_alerts, send_heal_alerts
 
 log = logging.getLogger("doctor")
 
@@ -130,6 +130,9 @@ def cmd_heal(args: argparse.Namespace) -> int:
     for a in actions:
         print(f"    {a}")
     print()
+
+    # Notify configured alert channels about what the doctor just did.
+    send_heal_alerts(actions)
 
     # Re-check after healing
     print("  Re-checking...")

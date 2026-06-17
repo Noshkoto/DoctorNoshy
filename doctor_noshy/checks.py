@@ -9,9 +9,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -523,6 +525,349 @@ def check_tunnel() -> CheckResult:
 
 
 # ---------------------------------------------------------------------------
+# Kanban checks
+#
+# Hermes' multi-agent Kanban board (v0.15+) lives at ~/.hermes/kanban.db.
+# These checks read the SQLite file read-only and gracefully no-op when the
+# DB is absent (users who don't run Kanban shouldn't see noise).
+#
+# The schema below is INFERRED — see README "Kanban Health" section and the
+# in-code constants for the names this module expects. Schema mismatches
+# surface as `status="unknown"` with the SQLite error attached, so the
+# operator sees exactly what differs from the assumed layout.
+# ---------------------------------------------------------------------------
+
+# Process patterns to look for (OR'd, same approach as the gateway check).
+KANBAN_DISPATCHER_PATTERNS = ("hermes.*kanban.*dispatcher", "kanban.*dispatch")
+
+
+def _kanban_db_path() -> Path:
+    return _hermes_home() / "kanban.db"
+
+
+def _kanban_config() -> Dict[str, int]:
+    """Env-overridable thresholds. Defaults match the task brief."""
+    def _intenv(name: str, default: int) -> int:
+        try:
+            return int(os.environ.get(name, default))
+        except (TypeError, ValueError):
+            return default
+    return {
+        "thrash_reclaims": _intenv("DOCTOR_KANBAN_THRASH_RECLAIMS", 3),
+        "thrash_window_min": _intenv("DOCTOR_KANBAN_THRASH_WINDOW_MIN", 30),
+        "blocked_warn": _intenv("DOCTOR_KANBAN_BLOCKED_WARN", 5),
+    }
+
+
+def _open_kanban_db_ro() -> Optional[sqlite3.Connection]:
+    """Open kanban.db read-only with a short busy timeout."""
+    db = _kanban_db_path()
+    if not db.exists():
+        return None
+    try:
+        return sqlite3.connect(
+            f"file:{db}?mode=ro", uri=True, timeout=2.0, isolation_level=None
+        )
+    except sqlite3.Error:
+        return None
+
+
+def _kanban_skip_if_absent(name: str, t0: float) -> Optional[CheckResult]:
+    """Return a benign OK result when kanban.db isn't present, else None."""
+    if _kanban_db_path().exists():
+        return None
+    return CheckResult(
+        name=name,
+        status="ok",
+        message="Kanban not in use",
+        elapsed_ms=(time.monotonic() - t0) * 1000,
+    )
+
+
+def _is_process_zombie(pid: int) -> Optional[bool]:
+    """True if the process is a zombie, False if alive, None if gone or indeterminate.
+
+    Hermes' own crash detector uses ``os.kill(pid, 0)`` which returns truthy for
+    zombies — we explicitly inspect the process status instead. ``STATUS_ZOMBIE``
+    is meaningful on Linux/macOS; Windows has no zombie concept, so this
+    function effectively returns False there.
+    """
+    try:
+        return psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return None
+    except (psutil.AccessDenied, OSError):
+        return None
+
+
+def check_kanban_dispatcher() -> CheckResult:
+    """Is the Kanban dispatcher daemon running?"""
+    t0 = time.monotonic()
+    skip = _kanban_skip_if_absent("Kanban Dispatcher", t0)
+    if skip:
+        return skip
+
+    cmd = " || ".join(f"pgrep -f '{p}'" for p in KANBAN_DISPATCHER_PATTERNS)
+    result = _run(cmd)
+    elapsed = (time.monotonic() - t0) * 1000
+    pids = [p for p in result.stdout.strip().split("\n") if p]
+
+    if pids:
+        return CheckResult(
+            name="Kanban Dispatcher",
+            status="ok",
+            message=f"Running (PID {', '.join(pids[:3])})",
+            details={"pids": pids},
+            elapsed_ms=elapsed,
+        )
+    return CheckResult(
+        name="Kanban Dispatcher",
+        status="critical",
+        message="Not running (kanban.db present but no dispatcher process)",
+        elapsed_ms=elapsed,
+    )
+
+
+def check_kanban_zombie_workers() -> CheckResult:
+    """Detect in_progress tasks whose claimed worker process is a zombie."""
+    t0 = time.monotonic()
+    skip = _kanban_skip_if_absent("Kanban Zombie Workers", t0)
+    if skip:
+        return skip
+
+    conn = _open_kanban_db_ro()
+    if conn is None:
+        return CheckResult(
+            name="Kanban Zombie Workers",
+            status="unknown",
+            message="Could not open kanban.db read-only",
+            elapsed_ms=(time.monotonic() - t0) * 1000,
+        )
+
+    try:
+        try:
+            rows = conn.execute(
+                "SELECT id, worker_pid FROM tasks "
+                "WHERE status = 'in_progress' AND worker_pid IS NOT NULL"
+            ).fetchall()
+        except sqlite3.Error as e:
+            return CheckResult(
+                name="Kanban Zombie Workers",
+                status="unknown",
+                message=f"Schema mismatch on tasks: {e}",
+                elapsed_ms=(time.monotonic() - t0) * 1000,
+            )
+
+        zombies: List[Dict[str, Any]] = []
+        for task_id, pid in rows:
+            if pid is None:
+                continue
+            try:
+                pid_int = int(pid)
+            except (TypeError, ValueError):
+                continue
+            if _is_process_zombie(pid_int):
+                zombies.append({"task_id": task_id, "pid": pid_int})
+    finally:
+        conn.close()
+
+    elapsed = (time.monotonic() - t0) * 1000
+    if not zombies:
+        return CheckResult(
+            name="Kanban Zombie Workers",
+            status="ok",
+            message=f"No zombies ({len(rows)} active worker(s))",
+            details={"active_workers": len(rows)},
+            elapsed_ms=elapsed,
+        )
+    return CheckResult(
+        name="Kanban Zombie Workers",
+        status="critical",
+        message=f"{len(zombies)} zombie worker(s) blocking tasks",
+        details={"zombies": zombies[:50]},
+        elapsed_ms=elapsed,
+    )
+
+
+def check_kanban_thrashing() -> CheckResult:
+    """Detect tasks reclaimed N+ times in a rolling window — likely stuck in a
+    reclaim/respawn loop because a single tool call is exceeding the claim TTL."""
+    t0 = time.monotonic()
+    skip = _kanban_skip_if_absent("Kanban Thrashing", t0)
+    if skip:
+        return skip
+
+    cfg = _kanban_config()
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(minutes=cfg["thrash_window_min"])
+    ).isoformat()
+
+    conn = _open_kanban_db_ro()
+    if conn is None:
+        return CheckResult(
+            name="Kanban Thrashing",
+            status="unknown",
+            message="Could not open kanban.db read-only",
+            elapsed_ms=(time.monotonic() - t0) * 1000,
+        )
+
+    try:
+        try:
+            rows = conn.execute(
+                "SELECT task_id, COUNT(*) AS reclaim_count "
+                "FROM task_runs "
+                "WHERE outcome = 'reclaimed' AND started_at >= ? "
+                "GROUP BY task_id HAVING reclaim_count >= ? "
+                "ORDER BY reclaim_count DESC LIMIT 50",
+                (cutoff, cfg["thrash_reclaims"]),
+            ).fetchall()
+        except sqlite3.Error as e:
+            return CheckResult(
+                name="Kanban Thrashing",
+                status="unknown",
+                message=f"Schema mismatch on task_runs: {e}",
+                elapsed_ms=(time.monotonic() - t0) * 1000,
+            )
+    finally:
+        conn.close()
+
+    elapsed = (time.monotonic() - t0) * 1000
+    thrashing = [{"task_id": r[0], "reclaim_count": r[1]} for r in rows]
+    if not thrashing:
+        return CheckResult(
+            name="Kanban Thrashing",
+            status="ok",
+            message="No thrashing tasks",
+            elapsed_ms=elapsed,
+        )
+    # Critical so the healer (which only acts on critical) will pick it up.
+    return CheckResult(
+        name="Kanban Thrashing",
+        status="critical",
+        message=(
+            f"{len(thrashing)} task(s) reclaimed "
+            f">={cfg['thrash_reclaims']}x in {cfg['thrash_window_min']}min"
+        ),
+        details={
+            "thrashing": thrashing,
+            "threshold": cfg["thrash_reclaims"],
+            "window_min": cfg["thrash_window_min"],
+        },
+        elapsed_ms=elapsed,
+    )
+
+
+def check_kanban_blocked() -> CheckResult:
+    """Count and list tasks in the 'blocked' state so they don't go unnoticed."""
+    t0 = time.monotonic()
+    skip = _kanban_skip_if_absent("Kanban Blocked", t0)
+    if skip:
+        return skip
+
+    cfg = _kanban_config()
+    conn = _open_kanban_db_ro()
+    if conn is None:
+        return CheckResult(
+            name="Kanban Blocked",
+            status="unknown",
+            message="Could not open kanban.db read-only",
+            elapsed_ms=(time.monotonic() - t0) * 1000,
+        )
+
+    try:
+        try:
+            rows = conn.execute(
+                "SELECT id, blocked_reason FROM tasks "
+                "WHERE status = 'blocked' "
+                "ORDER BY updated_at DESC LIMIT 50"
+            ).fetchall()
+        except sqlite3.Error as e:
+            return CheckResult(
+                name="Kanban Blocked",
+                status="unknown",
+                message=f"Schema mismatch on tasks: {e}",
+                elapsed_ms=(time.monotonic() - t0) * 1000,
+            )
+    finally:
+        conn.close()
+
+    elapsed = (time.monotonic() - t0) * 1000
+    blocked = [{"task_id": r[0], "reason": r[1]} for r in rows]
+    n = len(blocked)
+    if n == 0:
+        return CheckResult(
+            name="Kanban Blocked",
+            status="ok",
+            message="No blocked tasks",
+            elapsed_ms=elapsed,
+        )
+    status = "warn" if n >= cfg["blocked_warn"] else "ok"
+    return CheckResult(
+        name="Kanban Blocked",
+        status=status,
+        message=f"{n} blocked task(s)",
+        details={"blocked": blocked, "threshold": cfg["blocked_warn"]},
+        elapsed_ms=elapsed,
+    )
+
+
+def check_kanban_duplicate_workers() -> CheckResult:
+    """Detect more than one open worker run per task_id — wasted token spend."""
+    t0 = time.monotonic()
+    skip = _kanban_skip_if_absent("Kanban Duplicate Workers", t0)
+    if skip:
+        return skip
+
+    conn = _open_kanban_db_ro()
+    if conn is None:
+        return CheckResult(
+            name="Kanban Duplicate Workers",
+            status="unknown",
+            message="Could not open kanban.db read-only",
+            elapsed_ms=(time.monotonic() - t0) * 1000,
+        )
+
+    try:
+        try:
+            rows = conn.execute(
+                "SELECT task_id, COUNT(*) AS worker_count, "
+                "       GROUP_CONCAT(worker_pid) AS pids "
+                "FROM task_runs "
+                "WHERE ended_at IS NULL "
+                "GROUP BY task_id HAVING worker_count > 1 "
+                "ORDER BY worker_count DESC LIMIT 50"
+            ).fetchall()
+        except sqlite3.Error as e:
+            return CheckResult(
+                name="Kanban Duplicate Workers",
+                status="unknown",
+                message=f"Schema mismatch on task_runs: {e}",
+                elapsed_ms=(time.monotonic() - t0) * 1000,
+            )
+    finally:
+        conn.close()
+
+    elapsed = (time.monotonic() - t0) * 1000
+    dupes = [
+        {"task_id": r[0], "worker_count": r[1], "pids": r[2]} for r in rows
+    ]
+    if not dupes:
+        return CheckResult(
+            name="Kanban Duplicate Workers",
+            status="ok",
+            message="No duplicate workers",
+            elapsed_ms=elapsed,
+        )
+    return CheckResult(
+        name="Kanban Duplicate Workers",
+        status="critical",
+        message=f"{len(dupes)} task(s) with concurrent workers",
+        details={"duplicates": dupes},
+        elapsed_ms=elapsed,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Aggregate
 # ---------------------------------------------------------------------------
 
@@ -545,6 +890,11 @@ ALL_CHECKS = [
     check_skills,
     check_memory_files,
     check_cron_jobs,
+    check_kanban_dispatcher,
+    check_kanban_zombie_workers,
+    check_kanban_thrashing,
+    check_kanban_blocked,
+    check_kanban_duplicate_workers,
 ]
 
 
